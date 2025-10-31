@@ -1,0 +1,1038 @@
+import aiohttp
+import os
+import asyncio
+import sqlite3
+import time
+import random
+import threading
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
+import pytz
+from dotenv import load_dotenv
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# ------------------ Load environment ------------------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TIMEZONE = os.getenv("TIMEZONE", "Africa/Lagos")
+DB_PATH = os.getenv("DB_PATH", "trade_data.db")
+HTTP_PORT = int(os.environ.get("PORT", 8080))
+
+# ===== FIXED: DIRECTLY INCLUDE YOUR ADMIN ID =====
+ADMIN_IDS = [123456789]  # ⬅️ REPLACE THIS WITH YOUR ACTUAL NUMERIC ID
+
+print("🔍 ENV CHECK:")
+print(f" BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}")
+print(f" TIMEZONE: {TIMEZONE}")
+print(f" ADMIN_IDS: {ADMIN_IDS}")
+print("--------------------------------------------------")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required in environment variables")
+
+TZ = pytz.timezone(TIMEZONE)
+
+# ------------------ Optimized Settings ------------------
+MIN_SIGNAL_COOLDOWN = 60   # 1 minute minimum
+MAX_SIGNAL_COOLDOWN = 180  # 3 minutes maximum
+
+# Simple tracking
+active_users = set()
+user_start_times = {}
+approved_users = set(ADMIN_IDS)  # Admins are automatically approved
+
+# ------------------ OPTIMIZED WATCHLIST ------------------
+# Major Currency Pairs (Most Liquid)
+POCKET_MAJOR_FOREX = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", 
+    "USD/CAD", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY"
+]
+
+# Top Cryptocurrencies
+POCKET_CRYPTO = [
+    "BTC/USD", "ETH/USD", "LTC/USD", "XRP/USD", "BCH/USD",
+    "ADA/USD", "DOGE/USD", "SOL/USD", "DOT/USD", "AVAX/USD"
+]
+
+# Major Commodities
+POCKET_COMMODITIES = [
+    "XAU/USD", "XAG/USD", "OIL/USD", "NATURALGAS/USD", "COPPER/USD"
+]
+
+# Blue-Chip Stocks
+POCKET_STOCKS = [
+    "AAPL", "TSLA", "AMZN", "GOOGL", "MSFT",
+    "META", "NFLX", "NVDA", "AMD", "INTC"
+]
+
+# Combine all watchlists
+WATCHLIST = (
+    POCKET_MAJOR_FOREX + 
+    POCKET_CRYPTO + 
+    POCKET_COMMODITIES + 
+    POCKET_STOCKS
+)
+
+print(f"📊 Total assets in watchlist: {len(WATCHLIST)}")
+print(f"🌍 Forex: {len(POCKET_MAJOR_FOREX)}")
+print(f"₿ Crypto: {len(POCKET_CRYPTO)}")
+print(f"💰 Commodities: {len(POCKET_COMMODITIES)}")
+print(f"🏢 Stocks: {len(POCKET_STOCKS)}")
+
+# ------------------ HTTP health server ------------------
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            if self.path in ["/", "/health"]:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b"ADMIN TRADING BOT - Live")
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception:
+            self.send_response(500)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        return
+
+def start_http_server():
+    try:
+        server = HTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)
+        print(f"✅ HTTP server listening on port {HTTP_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ HTTP server failed: {e}")
+
+# ------------------ DB (SQLite) ------------------
+def init_db(path: str = DB_PATH):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            side TEXT,
+            entry_price REAL,
+            confidence REAL,
+            label TEXT,
+            details TEXT,
+            timestamp TEXT,
+            status TEXT DEFAULT 'OPEN',
+            exit_price REAL,
+            exit_time TEXT,
+            profit REAL,
+            platform TEXT DEFAULT 'PocketOption'
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            status TEXT DEFAULT 'pending',
+            join_date TEXT,
+            subscription_type TEXT DEFAULT 'premium',
+            approved INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized")
+
+init_db()
+
+def load_approved_users():
+    """Load approved users from database"""
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id FROM subscribers WHERE approved = 1")
+        approved = {row[0] for row in cur.fetchall()}
+        conn.close()
+        
+        # Add admin IDs to approved users
+        approved.update(ADMIN_IDS)
+        return approved
+    except Exception as e:
+        print(f"❌ Error loading approved users: {e}")
+        return set(ADMIN_IDS)  # Return at least admin IDs
+
+# Load approved users on startup
+approved_users = load_approved_users()
+print(f"✅ Loaded {len(approved_users)} approved users (including {len(ADMIN_IDS)} admins)")
+
+# ------------------ ADMIN TRADING BOT ------------------
+class AdminTradingBot:
+    def __init__(self):
+        self.session = None
+        self.total_signals_sent = 0
+        self.user_loops = {}
+        
+    async def init_session(self):
+        try:
+            self.session = aiohttp.ClientSession()
+            print("✅ Session initialized")
+        except Exception as e:
+            print(f"❌ Session failed: {e}")
+            await asyncio.sleep(5)
+            await self.init_session()
+
+    def add_user(self, user_id: int, username: str):
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            cur = conn.cursor()
+            
+            # Check if user already exists
+            cur.execute('SELECT approved FROM subscribers WHERE chat_id = ?', (user_id,))
+            existing = cur.fetchone()
+            
+            if existing:
+                # User exists, update if needed
+                if existing[0] == 0 and user_id in ADMIN_IDS:
+                    # This is an admin who wasn't marked as approved
+                    cur.execute('UPDATE subscribers SET approved = 1, status = "approved" WHERE chat_id = ?', (user_id,))
+                    approved_users.add(user_id)
+                    print(f"✅ Admin user {user_id} auto-approved")
+            else:
+                # New user
+                is_approved = 1 if user_id in ADMIN_IDS else 0
+                status = "approved" if user_id in ADMIN_IDS else "pending"
+                
+                cur.execute('INSERT INTO subscribers (chat_id, username, status, join_date, approved) VALUES (?, ?, ?, ?, ?)',
+                          (user_id, username, status, datetime.now().isoformat(), is_approved))
+                
+                if user_id in ADMIN_IDS:
+                    approved_users.add(user_id)
+                    print(f"✅ Admin user {user_id} registered and auto-approved")
+                else:
+                    print(f"✅ User added: {user_id} (Pending Approval)")
+            
+            conn.commit()
+            conn.close()
+                
+        except Exception as e:
+            print("Add user error:", e)
+
+    def is_user_approved(self, user_id: int) -> bool:
+        """Check if user is approved - admins are always approved"""
+        return user_id in approved_users or user_id in ADMIN_IDS
+
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        return user_id in ADMIN_IDS
+
+    def approve_user(self, user_id: int) -> bool:
+        """Approve a user"""
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            cur = conn.cursor()
+            cur.execute("UPDATE subscribers SET approved = 1, status = 'approved' WHERE chat_id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+            
+            approved_users.add(user_id)
+            print(f"✅ User {user_id} approved")
+            return True
+        except Exception as e:
+            print(f"❌ Error approving user: {e}")
+            return False
+
+    def get_all_subscribers(self) -> List[Dict]:
+        """Get all subscribers with details"""
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            cur = conn.cursor()
+            cur.execute("SELECT chat_id, username, status, join_date, approved FROM subscribers ORDER BY join_date DESC")
+            subscribers = []
+            for row in cur.fetchall():
+                subscribers.append({
+                    'chat_id': row[0],
+                    'username': row[1] or 'No Username',
+                    'status': row[2],
+                    'join_date': row[3],
+                    'approved': bool(row[4]),
+                    'is_admin': row[0] in ADMIN_IDS
+                })
+            conn.close()
+            return subscribers
+        except Exception as e:
+            print(f"❌ Error getting subscribers: {e}")
+            return []
+
+    async def safe_send_message(self, user_id: int, application, message: str):
+        """Safely send message with error handling"""
+        try:
+            if user_id in active_users and self.is_user_approved(user_id):
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                return True
+            return False
+        except Exception as e:
+            print(f"❌ Failed to send message to {user_id}: {e}")
+            return False
+
+    def get_next_candle_time(self):
+        """Calculate timing for next candle (5-minute candles)"""
+        now = datetime.now()
+        # Get the start of next 5-minute interval
+        next_minute = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+        seconds_until_next_candle = (next_minute - now).total_seconds()
+        
+        # Pre-entry at 40 seconds before next candle
+        preentry_time = next_minute - timedelta(seconds=40)
+        seconds_until_preentry = (preentry_time - now).total_seconds()
+        
+        return {
+            'next_candle_time': next_minute,
+            'seconds_until_next_candle': seconds_until_next_candle,
+            'seconds_until_preentry': max(seconds_until_preentry, 1)  # At least 1 second
+        }
+
+    async def generate_signal(self, symbol: str) -> Dict[str, Any]:
+        """Generate signal aligned with new 5-minute candle"""
+        try:
+            # Get timing for next candle
+            timing = self.get_next_candle_time()
+            next_candle_time = timing['next_candle_time']
+            
+            # Format times
+            entry_time_str = next_candle_time.strftime("%H:%M")
+            current_time_str = datetime.now().strftime("%H:%M:%S")
+            
+            # Determine direction
+            direction = "UP" if random.random() < 0.6 else "DOWN"
+            direction_emoji = "🟢 UP" if direction == "UP" else "🔴 DOWN"
+            
+            # Asset type detection
+            asset_type = "FOREX"
+            if symbol in POCKET_CRYPTO:
+                asset_type = "CRYPTO"
+            elif symbol in POCKET_COMMODITIES:
+                asset_type = "COMMODITY"
+            elif symbol in POCKET_STOCKS:
+                asset_type = "STOCK"
+            
+            signal_id = f"SIG-{random.randint(1000, 9999)}"
+            confidence = random.randint(78, 89)
+            
+            # PRE-ENTRY MESSAGE (40 seconds before new candle)
+            preentry_message = f"""⏰ **PRE-ENTRY ALERT** ⏰
+
+🎯 **{symbol}** | **{direction}** | **5M**
+🕒 **Current Time:** {current_time_str}
+⏰ **Entry Time:** {entry_time_str} (New 5M Candle)
+📊 **Signal Strength:** HIGH
+
+**Prepare for the new 5-minute candle!** 🚀"""
+            
+            # MAIN SIGNAL MESSAGE (At new candle)
+            signal_message = f"""🎯 **NEW 5M CANDLE SIGNAL** 🎯
+
+📊 **ASSET:** {symbol}
+🎯 **DIRECTION:** {direction_emoji}
+⏰ **TIMEFRAME:** 5 Minutes
+💰 **PAYOUT:** 80-95%
+🔄 **STRATEGY:** 5-Minute Candle Breakout
+
+✅ **TRADE SETUP:**
+• Entry: New 5M Candle Open
+• Confidence: {confidence}%
+• Risk: Medium
+• Duration: 5 Minutes
+
+📈 **TECHNICALS:**
+• Trading new 5-minute candle formation
+• Optimal entry at candle open
+• Clear directional bias on higher timeframe
+
+🚀 **EXECUTE NOW:**
+1. Open Pocket Option
+2. Select {symbol} & 5M
+3. Set {direction} at {entry_time_str}
+4. Confirm trade
+
+🆔 **ID:** {signal_id}
+⏰ **Entry:** {entry_time_str} (5M Candle Open)
+📍 **Expiry:** 5 Minutes
+
+⏱️ **Next signal within 1-3 minutes!**"""
+            
+            self.total_signals_sent += 1
+            
+            return {
+                'symbol': symbol,
+                'asset_type': asset_type,
+                'preentry_message': preentry_message,
+                'signal_message': signal_message,
+                'preentry_delay': timing['seconds_until_preentry'],
+                'main_delay': timing['seconds_until_next_candle'],
+                'direction': direction,
+                'confidence': confidence,
+                'entry_time': entry_time_str
+            }
+            
+        except Exception as e:
+            print(f"❌ Signal generation error: {e}")
+            return await self.generate_signal("EUR/USD")
+
+    async def start_signals(self, user_id: int, application):
+        """Start signal generation with admin approval check"""
+        if not self.is_user_approved(user_id):
+            return "❌ **ACCESS DENIED**\n\nYour account is pending approval. Please wait for admin approval to start receiving signals."
+        
+        if user_id in active_users:
+            return "❌ Signals already running!"
+        
+        user_status = "🛡️ ADMIN" if self.is_admin(user_id) else "👤 USER"
+        print(f"🚀 Starting signals for {user_status} {user_id}")
+        active_users.add(user_id)
+        user_start_times[user_id] = time.time()
+        
+        # Start the signal loop
+        task = asyncio.create_task(self.admin_signal_loop(user_id, application))
+        self.user_loops[user_id] = task
+        
+        welcome_text = """🚀 **PREMIUM SIGNALS ACTIVATED!**
+
+✅ **Approved User Access**
+⏰ **5-Minute Candle Entries**
+🎯 **Pre-entry Alerts:** 40s before new candle
+📊 **Signal Interval:** 1-3 minutes
+🔄 **All signals on new 5M candles**"""
+        
+        if self.is_admin(user_id):
+            welcome_text += "\n\n🛡️ **ADMIN PRIVILEGES ACTIVATED**"
+        
+        welcome_text += """
+
+**🎯 SELECTED MARKETS:**
+• 🌍 10 Major Forex Pairs
+• ₿ 10 Top Cryptocurrencies  
+• 💰 5 Key Commodities
+• 🏢 10 Blue-Chip Stocks
+
+**Next signal within 1-3 minutes...** 🚀"""
+        
+        return welcome_text
+
+    async def stop_signals(self, user_id: int):
+        """Stop signals with proper cleanup"""
+        print(f"🛑 Stopping signals for user {user_id}")
+        active_users.discard(user_id)
+        
+        if user_id in user_start_times:
+            del user_start_times[user_id]
+        
+        if user_id in self.user_loops:
+            task = self.user_loops[user_id]
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del self.user_loops[user_id]
+        
+        return "🛑 Signals stopped."
+
+    async def admin_signal_loop(self, user_id: int, application):
+        """Signal loop for approved users with 5-minute candles"""
+        try:
+            await asyncio.sleep(1)
+            
+            user_status = "ADMIN" if self.is_admin(user_id) else "USER"
+            print(f"🎯 Starting signal loop for {user_status} {user_id}")
+            
+            # Send welcome message
+            welcome_msg = """🎯 **PREMIUM 5M TRADING BOT**
+
+⚡ **APPROVED USER FEATURES:**
+• All entries on new 5-minute candles
+• Pre-entry alerts 40 seconds before
+• Premium asset selection
+• Next signal within 1-3 minutes"""
+            
+            if self.is_admin(user_id):
+                welcome_msg += "\n• 🛡️ **ADMIN PRIVILEGES ACTIVE**"
+            
+            welcome_msg += """
+📊 **SELECTED ASSETS:**
+• EUR/USD, GBP/USD, USD/JPY, Gold, Oil
+• BTC, ETH, XRP, ADA, SOL
+• AAPL, TSLA, AMZN, NVDA, and more
+
+⏰ **5-MINUTE STRATEGY:**
+Trade the new 5-minute candle formation for optimal entries!
+
+**Next signal within 1-3 minutes...** 🕒"""
+            
+            await self.safe_send_message(user_id, application, welcome_msg)
+            
+            consecutive_errors = 0
+            
+            while user_id in active_users and self.is_user_approved(user_id):
+                try:
+                    # Select random asset from optimized watchlist
+                    symbol = random.choice(WATCHLIST)
+                    
+                    # Generate signal with new candle timing
+                    signal_data = await self.generate_signal(symbol)
+                    
+                    if signal_data:
+                        # Send pre-entry message (40s before new candle)
+                        if signal_data['preentry_delay'] > 0:
+                            await asyncio.sleep(signal_data['preentry_delay'])
+                            await self.safe_send_message(user_id, application, signal_data['preentry_message'])
+                        
+                        # Send main signal at new candle
+                        if signal_data['main_delay'] > 0:
+                            await asyncio.sleep(signal_data['main_delay'] - signal_data['preentry_delay'])
+                            await self.safe_send_message(user_id, application, signal_data['signal_message'])
+                        
+                        consecutive_errors = 0
+                        print(f"✅ {user_status} {user_id}: 5M signal for {symbol} at {signal_data['entry_time']}")
+                    
+                    # Wait before next signal (1-3 minutes)
+                    wait_time = random.randint(MIN_SIGNAL_COOLDOWN, MAX_SIGNAL_COOLDOWN)
+                    print(f"⏰ {user_status} {user_id}: Next signal in {wait_time}s")
+                    
+                    # Check every second if we should stop
+                    for _ in range(wait_time):
+                        if user_id not in active_users or not self.is_user_approved(user_id):
+                            break
+                        await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"❌ Signal loop error for user {user_id}: {e}")
+                    
+                    if consecutive_errors >= 3:
+                        print(f"🚨 Too many errors for user {user_id}, stopping...")
+                        await self.stop_signals(user_id)
+                        break
+                    
+                    await asyncio.sleep(10)
+                    
+        except asyncio.CancelledError:
+            print(f"🔚 Signal loop cancelled for user {user_id}")
+        except Exception as e:
+            print(f"💥 FATAL: Signal loop crashed for user {user_id}: {e}")
+            await self.stop_signals(user_id)
+
+# Initialize ADMIN bot
+trading_bot = AdminTradingBot()
+
+# ------------------ ADMIN KEYBOARD ------------------
+def get_main_keyboard(user_id: int):
+    keyboard = [
+        [InlineKeyboardButton("🚀 START SIGNALS", callback_data="start_signals")],
+        [InlineKeyboardButton("🛑 STOP SIGNALS", callback_data="stop_signals")],
+        [InlineKeyboardButton("📊 LIVE STATS", callback_data="live_stats"),
+         InlineKeyboardButton("🎯 ASSETS", callback_data="show_assets")]
+    ]
+    
+    # Add admin panel button for admins
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("👑 ADMIN PANEL", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+# ------------------ ADMIN HANDLERS ------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command with admin approval check"""
+    try:
+        user = update.effective_user
+        trading_bot.add_user(user.id, user.username)
+        
+        is_admin = user.id in ADMIN_IDS
+        is_approved = trading_bot.is_user_approved(user.id)
+        
+        if is_admin:
+            welcome_text = """
+🎯 **PREMIUM 5M TRADING BOT** ⚡
+
+**🛡️ ADMINISTRATOR ACCESS**
+**⚡ FULL PRIVILEGES:**
+• All premium signals
+• Admin control panel
+• User management
+• Auto-approved access
+
+**📊 SELECTED MARKETS:**
+• 10 Major Forex Pairs
+• 10 Top Cryptocurrencies  
+• 5 Key Commodities
+• 10 Blue-Chip Stocks
+
+**⏰ 5-MINUTE STRATEGY:**
+Trade new 5-minute candle formations for optimal entries!
+
+**🚀 START TRADING:**
+Click below to begin 5-minute trading!
+"""
+        elif is_approved:
+            welcome_text = """
+🎯 **PREMIUM 5M TRADING BOT** ⚡
+
+**✅ APPROVED USER ACCESS**
+**⚡ PREMIUM FEATURES:**
+• All signals on new 5-minute candles
+• Pre-entry alerts 40 seconds before
+• Optimized asset selection
+• Next signal within 1-3 minutes
+
+**🚀 START TRADING:**
+Click below to begin 5-minute trading!
+"""
+        else:
+            welcome_text = """
+🎯 **PREMIUM 5M TRADING BOT** ⚡
+
+**⏳ PENDING APPROVAL**
+Thank you for registering! Your account is currently **pending admin approval**.
+
+**📋 WHAT TO EXPECT:**
+• Premium 5-minute candle signals
+• 40-second pre-entry alerts  
+• 1-3 minute signal intervals
+• All major markets
+
+**✅ APPROVAL PROCESS:**
+You will be notified once your account is approved by admin.
+
+**Please wait for approval confirmation...** ⏰
+"""
+        
+        await update.message.reply_text(
+            welcome_text, 
+            reply_markup=get_main_keyboard(user.id),
+            parse_mode='Markdown'
+        )
+        
+        user_type = "ADMIN" if is_admin else "APPROVED USER" if is_approved else "PENDING USER"
+        print(f"✅ Start command for {user_type} {user.id}")
+        
+    except Exception as e:
+        print(f"❌ Start command error: {e}")
+        await update.message.reply_text("Error starting bot. Please try again.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Button handler with admin approval check"""
+    try:
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        await query.answer()
+        
+        print(f"🎮 Button pressed: {query.data} by user {user_id}")
+        
+        if query.data == "start_signals":
+            result = await trading_bot.start_signals(user_id, context.application)
+            await query.edit_message_text(result, reply_markup=get_main_keyboard(user_id))
+            
+        elif query.data == "stop_signals":
+            result = await trading_bot.stop_signals(user_id)
+            await query.edit_message_text(result, reply_markup=get_main_keyboard(user_id))
+            
+        elif query.data == "live_stats":
+            await show_live_stats(query, user_id)
+            
+        elif query.data == "show_assets":
+            await show_assets_handler(query, user_id)
+            
+        elif query.data == "admin_panel":
+            if user_id in ADMIN_IDS:
+                await show_admin_panel(query)
+            else:
+                await query.edit_message_text("❌ Admin access required.", reply_markup=get_main_keyboard(user_id))
+            
+    except Exception as e:
+        print(f"❌ Button handler error: {e}")
+        try:
+            await query.edit_message_text("❌ Error. Please try /start again.", reply_markup=get_main_keyboard(user_id))
+        except:
+            pass
+
+async def show_live_stats(query, user_id):
+    """Show live statistics"""
+    try:
+        is_running = user_id in active_users
+        is_approved = trading_bot.is_user_approved(user_id)
+        is_admin = user_id in ADMIN_IDS
+        running_time = 0
+        
+        if user_id in user_start_times:
+            running_time = time.time() - user_start_times[user_id]
+        
+        stats_text = f"""
+📊 **LIVE STATISTICS**
+
+**👤 USER STATUS:**
+• Account: {'🛡️ ADMIN' if is_admin else '✅ APPROVED' if is_approved else '⏳ PENDING'}
+• Signals: {'✅ RUNNING' if is_running else '❌ STOPPED'}
+• Running Time: {int(running_time/60)} minutes
+
+**📈 ASSET DISTRIBUTION:**
+• Forex Pairs: {len(POCKET_MAJOR_FOREX)}
+• Cryptocurrencies: {len(POCKET_CRYPTO)}
+• Commodities: {len(POCKET_COMMODITIES)}
+• Stocks: {len(POCKET_STOCKS)}
+
+**⚡ SYSTEM:**
+• Signal Timing: New 5M Candles
+• Pre-entry Alert: 40s before
+• Next Signal: Within 1-3 minutes
+• Strategy: 5M Candle Breakout
+
+**🎯 NEXT SIGNAL:** {'Within 1-3 minutes' if is_approved else 'After approval'}
+"""
+        
+        await query.edit_message_text(stats_text, reply_markup=get_main_keyboard(user_id), parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"❌ Stats error: {e}")
+        await query.edit_message_text("Error loading stats.", reply_markup=get_main_keyboard(user_id))
+
+async def show_assets_handler(query, user_id):
+    """Show optimized asset list"""
+    try:
+        is_approved = trading_bot.is_user_approved(user_id)
+        
+        assets_text = f"""
+🎯 **PREMIUM ASSET SELECTION**
+
+**💱 FOREX ({len(POCKET_MAJOR_FOREX)} pairs):**
+{', '.join(POCKET_MAJOR_FOREX)}
+
+**₿ CRYPTO ({len(POCKET_CRYPTO)} coins):**
+{', '.join(POCKET_CRYPTO)}
+
+**💰 COMMODITIES ({len(POCKET_COMMODITIES)}):**
+{', '.join(POCKET_COMMODITIES)}
+
+**🏢 STOCKS ({len(POCKET_STOCKS)}):**
+{', '.join(POCKET_STOCKS)}
+
+**📊 Total: {len(WATCHLIST)} premium assets**
+**⏰ Timeframe: 5 Minutes**
+**🔄 Next signal: {'Within 1-3 minutes' if is_approved else 'After approval'}** 🕒
+"""
+        
+        await query.edit_message_text(assets_text, reply_markup=get_main_keyboard(user_id), parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"❌ Assets error: {e}")
+        await query.edit_message_text("Error loading assets.", reply_markup=get_main_keyboard(user_id))
+
+async def show_admin_panel(query):
+    """Show admin panel"""
+    try:
+        admin_text = """
+👑 **ADMIN CONTROL PANEL**
+
+**🛠️ QUICK ACTIONS:**
+• Use `/subscribers` - View all users
+• Use `/approve USER_ID` - Approve users
+• Use `/stats` - Bot statistics
+
+**📊 REAL-TIME STATS:"""
+        
+        subscribers = trading_bot.get_all_subscribers()
+        total_users = len(subscribers)
+        approved_users = sum(1 for s in subscribers if s['approved'])
+        pending_users = total_users - approved_users
+        active_now = len(active_users)
+        
+        admin_text += f"""
+• Total Users: {total_users}
+• Approved: {approved_users}
+• Pending: {pending_users}
+• Active Now: {active_now}
+• Total Signals: {trading_bot.total_signals_sent}
+
+**⚡ ADMIN IDS:**
+"""
+        
+        for admin_id in ADMIN_IDS:
+            admin_text += f"• `{admin_id}`\n"
+        
+        admin_text += "\n**Use commands in chat for full control.**"
+        
+        await query.edit_message_text(admin_text, reply_markup=get_main_keyboard(query.from_user.id), parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"❌ Admin panel error: {e}")
+        await query.edit_message_text("Error loading admin panel.", reply_markup=get_main_keyboard(query.from_user.id))
+
+# ------------------ ADMIN COMMANDS ------------------
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command handler"""
+    try:
+        user_id = update.effective_user.id
+        
+        # Check if user is admin
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("❌ Access denied. Admin only.")
+            return
+        
+        if not context.args:
+            admin_help = """
+👑 **ADMIN COMMANDS**
+
+**User Management:**
+• /subscribers - View all subscribers
+• /approve <user_id> - Approve a user
+• /stats - Bot statistics
+
+**Examples:**
+• `/subscribers` - List all users
+• `/approve 123456789` - Approve user
+• `/stats` - View bot stats
+"""
+            await update.message.reply_text(admin_help, parse_mode='Markdown')
+            return
+        
+        command = context.args[0].lower()
+        
+        if command == "subscribers":
+            await show_subscribers(update, context)
+        elif command == "approve":
+            await approve_user(update, context)
+        elif command == "stats":
+            await admin_stats(update, context)
+        else:
+            await update.message.reply_text("❌ Unknown admin command.")
+            
+    except Exception as e:
+        print(f"❌ Admin command error: {e}")
+        await update.message.reply_text("❌ Admin command error.")
+
+async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all subscribers to admin"""
+    try:
+        subscribers = trading_bot.get_all_subscribers()
+        
+        if not subscribers:
+            await update.message.reply_text("📭 No subscribers found.")
+            return
+        
+        total_users = len(subscribers)
+        approved_users = sum(1 for s in subscribers if s['approved'])
+        pending_users = total_users - approved_users
+        
+        subscribers_text = f"""
+👥 **SUBSCRIBER MANAGEMENT**
+
+**📊 OVERVIEW:**
+• Total Users: {total_users}
+• Approved: {approved_users}
+• Pending: {pending_users}
+
+**📋 USER LIST:**
+"""
+        
+        for i, sub in enumerate(subscribers[:20], 1):  # Show first 20 users
+            status_emoji = "🛡️" if sub['is_admin'] else "✅" if sub['approved'] else "⏳"
+            status_text = "ADMIN" if sub['is_admin'] else "APPROVED" if sub['approved'] else "PENDING"
+            subscribers_text += f"\n{i}. {sub['username']} (ID: `{sub['chat_id']}`) {status_emoji}"
+            subscribers_text += f"\n   📅 Joined: {sub['join_date'][:10]}"
+            subscribers_text += f"\n   📊 Status: {status_text}\n"
+        
+        if len(subscribers) > 20:
+            subscribers_text += f"\n... and {len(subscribers) - 20} more users"
+        
+        subscribers_text += f"\n\n**Use:** `/approve USER_ID` to approve users"
+        
+        await update.message.reply_text(subscribers_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"❌ Show subscribers error: {e}")
+        await update.message.reply_text("❌ Error loading subscribers.")
+
+async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Approve a user"""
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ Usage: /approve <user_id>")
+            return
+        
+        user_id_to_approve = int(context.args[1])
+        
+        # Don't allow approving admins (they're auto-approved)
+        if user_id_to_approve in ADMIN_IDS:
+            await update.message.reply_text("ℹ️ Admin users are automatically approved.")
+            return
+        
+        if trading_bot.approve_user(user_id_to_approve):
+            # Notify the approved user if possible
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id_to_approve,
+                    text="🎉 **ACCOUNT APPROVED!**\n\nYour account has been approved by admin. You can now start receiving premium 5-minute trading signals!\n\nUse /start to begin trading! 🚀",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                print(f"⚠️ Could not notify user {user_id_to_approve}: {e}")
+            
+            await update.message.reply_text(f"✅ User `{user_id_to_approve}` approved successfully!", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Failed to approve user `{user_id_to_approve}`", parse_mode='Markdown')
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID. Please provide a numeric user ID.")
+    except Exception as e:
+        print(f"❌ Approve user error: {e}")
+        await update.message.reply_text("❌ Error approving user.")
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show admin statistics"""
+    try:
+        subscribers = trading_bot.get_all_subscribers()
+        total_users = len(subscribers)
+        approved_users = sum(1 for s in subscribers if s['approved'])
+        active_now = len(active_users)
+        
+        stats_text = f"""
+👑 **ADMIN STATISTICS**
+
+**📊 USER STATS:**
+• Total Subscribers: {total_users}
+• Approved Users: {approved_users}
+• Pending Approval: {total_users - approved_users}
+• Active Now: {active_now}
+• Admin Users: {len(ADMIN_IDS)}
+
+**🚀 PERFORMANCE:**
+• Total Signals Sent: {trading_bot.total_signals_sent}
+• Active Signal Loops: {len(trading_bot.user_loops)}
+
+**📈 ASSETS:**
+• Total Assets: {len(WATCHLIST)}
+• Forex: {len(POCKET_MAJOR_FOREX)}
+• Crypto: {len(POCKET_CRYPTO)}
+• Commodities: {len(POCKET_COMMODITIES)}
+• Stocks: {len(POCKET_STOCKS)}
+
+**🛡️ ADMIN IDS:**
+"""
+        
+        for admin_id in ADMIN_IDS:
+            stats_text += f"• `{admin_id}`\n"
+            
+        stats_text += """
+**⚡ SYSTEM:**
+• Timeframe: 5 Minutes
+• Signal Interval: 1-3 minutes
+• Pre-entry: 40s before
+• Status: ✅ Operational
+"""
+        
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"❌ Admin stats error: {e}")
+        await update.message.reply_text("❌ Error loading admin stats.")
+
+# ------------------ BOT SETUP ------------------
+def setup_bot_application():
+    """Setup bot with proper handlers"""
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("✅ Bot application setup complete")
+    return application
+
+# Create bot application
+bot_app = setup_bot_application()
+
+# ------------------ MAIN APPLICATION ------------------
+async def main_application():
+    """Main application entry point"""
+    restart_count = 0
+    max_restarts = 10
+    
+    while restart_count < max_restarts:
+        try:
+            print(f"🚀 Starting Admin Trading Bot... (Attempt {restart_count + 1})")
+            
+            # Initialize session
+            await trading_bot.init_session()
+            
+            # Start HTTP server in background
+            try:
+                server_thread = threading.Thread(target=start_http_server, daemon=True)
+                server_thread.start()
+                print("✅ HTTP server started")
+            except Exception as e:
+                print(f"❌ HTTP server error: {e}")
+            
+            # Start the bot
+            await bot_app.initialize()
+            await bot_app.start()
+            await bot_app.updater.start_polling()
+            
+            print("🤖 ADMIN TRADING BOT IS NOW LIVE!")
+            print(f"📊 Total Assets: {len(WATCHLIST)}")
+            print("✅ All signals on new 5M candles")
+            print("✅ Admin approval system")
+            print("✅ Subscriber management")
+            print("✅ Next signal within 1-3 minutes")
+            print(f"🛡️ Admin IDs: {ADMIN_IDS}")
+            print("✅ Port:", HTTP_PORT)
+            
+            # Reset restart count on success
+            restart_count = 0
+            
+            # Keep the application running
+            await asyncio.Future()  # Run forever
+            
+        except Exception as e:
+            restart_count += 1
+            print(f"❌ Bot crashed: {e}")
+            print(f"🔄 Restarting in 30 seconds... ({restart_count}/{max_restarts})")
+            
+            # Cleanup
+            try:
+                await bot_app.updater.stop()
+                await bot_app.stop()
+                await bot_app.shutdown()
+            except:
+                pass
+            
+            if restart_count >= max_restarts:
+                print("🚨 Maximum restart attempts reached. Bot stopped.")
+                break
+                
+            await asyncio.sleep(30)
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🎯 ADMIN TRADING BOT - 5M CANDLE STRATEGY")
+    print(f"📊 TOTAL ASSETS: {len(WATCHLIST)}")
+    print(f"🛡️ ADMIN IDS: {ADMIN_IDS}")
+    print("🌍 10 Major Forex Pairs")
+    print("₿ 10 Top Cryptocurrencies")
+    print("💰 5 Key Commodities") 
+    print("🏢 10 Blue-Chip Stocks")
+    print("⏰ All signals on new 5M candles")
+    print("✅ Pre-entry: 40s before new candle")
+    print("✅ Next signal: Within 1-3 minutes")
+    print("✅ Admin approval system")
+    print("✅ Subscriber management")
+    print("=" * 50)
+    
+    # Run the main bot application
+    asyncio.run(main_application())
