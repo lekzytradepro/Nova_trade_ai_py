@@ -1,0 +1,1 @@
+worker: python lekzy_trade_pro.py

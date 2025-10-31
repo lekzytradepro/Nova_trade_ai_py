@@ -1,0 +1,17 @@
+# Exported from Render on 2025-10-28T12:17:46Z
+version: "1"
+services:
+- type: web
+  name: Lekzy_trading_pro
+  runtime: docker
+  repo: https://github.com/lekzytradepro/Lekzy_trading_pro
+  plan: free
+  envVars:
+  - key: TWELVE_DATA_API_KEY_1
+    sync: false
+  - key: BOT_TOKEN
+    sync: false
+  region: oregon
+  dockerContext: .
+  dockerfilePath: ./Dockerfile
+  autoDeployTrigger: commit
